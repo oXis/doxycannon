@@ -1,7 +1,7 @@
 FROM alpine:latest
 
 # Install packages
-RUN apk --no-cache add openvpn dante-server supervisor && \
+RUN apk --no-cache add openvpn dante-server supervisor curl && \
 	rm -rf /var/cache/
 
 # Add image configuration and scripts
