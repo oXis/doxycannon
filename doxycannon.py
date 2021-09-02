@@ -204,7 +204,7 @@ def down(image, conf):
     print(f"[+] All containers based on {image} have been issued a kill command")
 
 
-def multistart(image, jobs, ports, running_container_list):
+def multistart(image, jobs, ports, running_container_list, expose):
     """Handler for starting containers. Called by Thread worker function."""
     while True:
         port = ports.get()
@@ -223,14 +223,16 @@ def multistart(image, jobs, ports, running_container_list):
             jobs.task_done()
             return
         else:
-            print(f"Starting: {container_name} on port {port}, path is {parent}")
-
+            if expose:
+                print(f"Starting: {container_name} on port {port}, path is {parent}")
+            else:
+                print(f"Starting: {container_name}, path is {parent}")
         try:
             doxy.containers.run(
                 image,
                 auto_remove=True,
                 privileged=True,
-                ports={'1080/tcp': ('127.0.0.1', port)},
+                ports={'1080/tcp': ('127.0.0.1', port)} if expose else None, # don't expose Tor nodes, use haproxy to reach
                 network=NET,
                 environment=[f"VPN={container_name}", f"VPNPATH=/{parent}"],
                 name=container_name,
@@ -243,7 +245,7 @@ def multistart(image, jobs, ports, running_container_list):
         jobs.task_done()
 
 
-def start_containers(image, ovpn_queue, port_range, running_container_list):
+def start_containers(image, ovpn_queue, port_range, running_container_list, expose):
     """Starts workers that call the container creation function"""
     port_queue = Queue(maxsize=0)
     for p in port_range:
@@ -252,7 +254,7 @@ def start_containers(image, ovpn_queue, port_range, running_container_list):
     for _ in range(THREADS):
         worker = Thread(
             target=multistart,
-            args=(image, ovpn_queue, port_queue,running_container_list,))
+            args=(image, ovpn_queue, port_queue,running_container_list,expose,))
         worker.setDaemon(True)
         worker.start()
     ovpn_queue.join()
@@ -287,21 +289,17 @@ def up(image, conf, port):
 
     names = [re.sub(".ovpn", "", name.name) for name in ovpn_file_queue.queue]
 
-    if port:
-        port_range = range(port, port + ovpn_file_count)
-        port_range2 = range(port + nb_running, port + ovpn_file_count + nb_running)
-    else:
-        port_range = range(START_PORT + nb_running, START_PORT + ovpn_file_count + nb_running)
-        port_range2 = range(START_PORT, START_PORT + ovpn_file_count + nb_running)
+    port_range = range(port, port + ovpn_file_count)
+    port_range2 = range(port + nb_running, port + ovpn_file_count + nb_running)
 
     # port_range2 is without already running containers
     write_haproxy_conf(names, port_range2)
     write_proxychains_conf(port_range2)
 
-    start_containers(image, ovpn_file_queue, port_range, running_container_list)
+    start_containers(image, ovpn_file_queue, port_range, running_container_list, True)
 
 
-def tor(count):
+def tor(count, expose, port):
     """Start <count> tor nodes to proxy through
 
     Will take the given number of tor nodes and start a proxy
@@ -319,7 +317,12 @@ def tor(count):
     running_container_list = running_containers(TOR)
     nb_running = len(running_container_list)
 
-    port_range = range(START_PORT + nb_running, START_PORT + count + nb_running)
+    # no need for port if no expose
+    if not expose:
+        port = 0
+
+    port_range = range(port + nb_running, port + count + nb_running)
+
     name_queue = Queue(maxsize=0)
     names = []
     for port in port_range:
@@ -327,27 +330,27 @@ def tor(count):
         names.append(f"tor_{port}")
 
     write_haproxy_conf(names, port_range)
-    start_containers(TOR, name_queue, port_range, running_container_list)
+    start_containers(TOR, name_queue, port_range, running_container_list, expose)
 
 
-def rotate():
+def rotate(port):
     """Creates a proxy rotator, HAProxy, based on the port range provided"""
     try:
         build(DOXY, path='./haproxy')
 
         print('[*] Staring single-port mode...')
-        print(f"[*] Proxy rotator listening on port {HAPORT}. Ctrl-c to quit")
+        print(f"[*] Proxy rotator listening on port {port}. Ctrl-c to quit")
         signal.signal(signal.SIGINT, signal_handler)
         cname = DOXY.split("/")[1]
 
-        doxy.containers.run(DOXY, name=cname, auto_remove=True, network=NET, ports={'1337/tcp': ('127.0.0.1', HAPORT)})
+        doxy.containers.run(DOXY, name=cname, auto_remove=True, network=NET, ports={'1337/tcp': ('127.0.0.1', port)})
 
     except Exception as err:
         print(err)
         raise
 
 
-def single(image, conf=None, nodes=None):
+def single(image, port, conf=None, nodes=None):
     """Starts an HAProxy rotator.
 
     Builds and starts the HAProxy container in the haproxy folder
@@ -358,10 +361,15 @@ def single(image, conf=None, nodes=None):
 
     if not list(containers_from_image(image).queue):
         if nodes:
-            tor(args.nodes)
+            tor(args.nodes, False)
         elif conf:
             up(image, conf)
-    rotate()
+
+    # So, if port is default then we swap for haproxy default port
+    if port == START_PORT:
+        port = HAPORT
+    
+    rotate(port)
 
 
 def interactive(image, conf):
@@ -401,40 +409,59 @@ def get_parsed():
     subparsers = parser.add_subparsers(dest="command")
 
     tor_cmd = subparsers.add_parser('tor', help="tor --help")
+
     tor_cmd.add_argument(
+        "--expose",
+        action="store_true",
+        dest="expose",
+        default=False,
+        required=False,
+        help="Expose Tor ports to use without Haproxy.")
+
+    tor_cmd.add_argument(
+        "--port",
+        action="store",
+        type=int,
+        dest="port",
+        default=START_PORT,
+        required=False,
+        help="Choose custom port for haproxy.")
+
+    tor_group = tor_cmd.add_mutually_exclusive_group()
+    tor_group.add_argument(
         '--nodes',
         type=int,
         default=3,
         dest="nodes",
         # required=True,
         help="Number of tor nodes to rotate through. Default: 3")
-    tor_cmd.add_argument(
+    tor_group.add_argument(
         '--up',
         action='store_true',
         default=False,
         dest='up',
         help='Brings up tor containers. 1 for each [--nodes]')
-    tor_cmd.add_argument(
+    tor_group.add_argument(
         '--down',
         action='store_true',
         default=False,
         dest='down',
         help='Bring down all tor containers')
-    tor_cmd.add_argument(
+    tor_group.add_argument(
         '--single',
         action='store_true',
         default=False,
         dest='single',
         help='Start an HAProxy rotator on a single port. Useful for Burpsuite')
     
-    tor_cmd.add_argument(
+    tor_group.add_argument(
         '--build',
         action='store_true',
         default=False,
         dest='build',
         help='Build tor image.')
 
-    tor_cmd.add_argument(
+    tor_group.add_argument(
         '--clean',
         action='store_true',
         default=False,
@@ -448,7 +475,7 @@ def get_parsed():
         action="store",
         type=int,
         dest="port",
-        default=None,
+        default=START_PORT,
         required=False,
         help="Choose custom port for containers. Port is not checked, if containers are already running, doxycannon will crash")
 
@@ -523,11 +550,11 @@ def handle_tor(args):
     elif args.build:
         build(TOR, path="./tor/")
     elif args.up:
-        tor(args.nodes)
+        tor(args.nodes, args.expose, args.port)
     elif args.down:
         down(TOR, None)
     elif args.single:
-        single(TOR, nodes=args.nodes)
+        single(TOR, args.port, nodes=args.nodes)
 
 
 def handle_vpn(args):
@@ -540,7 +567,7 @@ def handle_vpn(args):
     elif args.down:
         down(IMAGE, args.dir)
     elif args.single:
-        single(IMAGE, conf=args.dir)
+        single(IMAGE, args.port, conf=args.dir)
     elif args.interactive:
         interactive(IMAGE, args.dir)
 
